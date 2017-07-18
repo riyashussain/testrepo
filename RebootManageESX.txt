@@ -1,0 +1,257 @@
+#!/usr/bin/python
+# -*- mode: Python; tab-width: 4; indent-tabs-mode: nil; -*-
+# ex: set tabstop=4 :
+# Please do not change the two lines above. See PEP 8, PEP 263.
+#
+"""
+(c) Copyright 2010 Hewlett-Packard Development Company, L.P.
+Tests connectivity with hypervisor after provisioning ESXi through OSBP.
+"""
+
+import sys
+import os
+import time
+import traceback
+
+from osprov.profile import Kickstart
+from osprov.profile.kickstart import Directive
+from osprov.osbp import ThisTargetServer, logger
+from osprov.ogfs import ogsh_spin
+#pylint: disable=F0401,E0611
+from pytwist.com.opsware.locality import *
+from pytwist.com.opsware.server import *
+from pytwist.com.opsware.device import *
+from pytwist.com.opsware.virtualization import ESXServerConnectionInfoVO
+from pytwist.com.opsware.fido import AuthorizationException
+from pytwist.com.opsware.common import AgentlessManagementException, OpswareException
+from osprov.parsers.netconfig import NetConfigParser
+from pytwist import twistserver
+#pylint: enable=F0401,E0611
+
+ts = twistserver.TwistServer()
+ERROR_REALM_ID=1
+ERROR_REALM_NAME=2
+ERROR_MANAGEMENT_IP=3
+ERROR_KS_CFG=4
+ERROR_USAGE=5
+ERROR_CONNECTIVITY=6
+ERROR_ENCR_PWD=7
+ERROR_MID=8
+SUCCESS=0
+ERROR_AUTHORIZATION=9
+
+LOG = logger.getIt("reboot_and_manage")
+
+def simplifyNetData(net_data):
+	""" Returns with a single set of networking data """
+	new_data = {}
+	for name, value in net_data.items():
+		if type(value) == str:
+			new_data[name] =  value
+		else:
+			if value[0][0]:
+				new_data[name] = value[0][0]
+	return new_data
+
+def testConnection(esxVO):
+	hService = ts.virtualization.HypervisorService
+	try:
+		concResult = hService.testConnectionInfo(esxVO)
+	except AuthorizationException, e:
+		return ERROR_AUTHORIZATION
+	return SUCCESS
+
+def getDeviceAttribute(attr):
+	return open("./attr/%s" % attr).read()
+
+
+def main():
+
+	targetServer = ThisTargetServer()
+
+	#read Machine Id from the OGFS
+	try:
+		mid = long(getDeviceAttribute("mid"))
+	except OSError, ose:
+		print "Unable to read the target server's Machine Id in the OGFS."
+		return ERROR_MID
+	except ValueError:
+		print "Unable to read the target server's Machine Id in the OGFS. The file does not contain the expected data."
+		return ERROR_MID
+	#read Realm Id from the OGFS
+	try:
+		realm = getDeviceAttribute(".realm:i")
+		realmArr = realm.split(":")
+		if len(realmArr)<2:
+			print "Unable to read the target server's Realm Id in the OGFS. The file does not contain the expected data."
+			return ERROR_REALM_ID
+		realmId = long(realmArr[1])
+	except OSError, ose:
+		print "Unable to read the target server's Realm Id in the OGFS."
+		return ERROR_REALM_ID
+	except ValueError:
+		print "Unable to read the target server's Realm Id in the OGFS. The file does not contain the expected data."
+		return ERROR_REALM_ID
+
+	#read Realm Name from the OGFS
+	try:
+		realmName = getDeviceAttribute(".realm:n")
+	except OSError, ose:
+		print "Unable to read the target server's Realm Name in the OGFS."
+		return ERROR_REALM_NAME
+	#read target server IP from the OGFS
+	try:
+		serverIP = getDeviceAttribute("managementIP")
+	except OSError, ose:
+		print "Unable to read the target server's IP in the OGFS."
+		return ERROR_MANAGEMENT_IP
+
+	#read the ks.cfg file for root password
+	password = None
+	try:
+		ksobj = Kickstart(open(targetServer.pathToOGFS("tmp/user.ks.cfg"), "r"))
+		password = ksobj.rootpw[1];
+	except (OSError, KeyError, AttributeError), why:
+		print "Unable to read password from kick start file. Please verify the kick start configuration in the build plan"
+		LOG.exception(why)
+		return ERROR_KS_CFG
+
+	#calculate min and max wait times (default 2 min and 60 mins)
+	#read minWait and maxWait parameters from command line
+	minWait = 2 * 60;
+	maxWait = time.time() + (60 * 60);
+	args = sys.argv[1:]
+	try:
+		if len(args) == 1:
+			if int(args[0]) < 1:
+				print "maxWait can not be less than a minute."
+				return ERROR_USAGE
+			maxWait = time.time() + (int(args[0]) * 60)
+		elif len(args) == 2:
+			if int(args[0]) < 0:
+				print "minWait can not be negitive."
+				return ERROR_USAGE
+			if int(args[1]) < int(args[0]):
+				print "maxWait can not be less than minWait."
+				return ERROR_USAGE
+			if int(args[1]) < 1 :
+				print "maxWait can not be less than a minute"
+				return ERROR_USAGE
+			minWait = (int(args[0]) * 60)
+			maxWait = time.time() + (int(args[1]) * 60)
+		elif len(args) > 2:
+			print "Too many arguments usage: rebootAndManageESXi <num:minWait/maxWait> [num:maxWait]"
+			return ERROR_USAGE
+	except ValueError:
+		print "Arguments must be numbers usage: rebootAndManageESXi <num:minWait/maxWait> [num:maxWait]"
+		return ERROR_USAGE
+
+	#reboot the server to start the installation
+	targetServer.reboot()
+
+	#Check for static IP
+	parser = NetConfigParser(target_server = targetServer)
+	parser.netconfig_ca = """@hpsa_netconfig@"""
+	net_data  = parser.parse()
+	staticIP = None
+	if net_data:
+		LOG.info("Found static networking, will take IP address from there")
+		net_data = simplifyNetData(net_data)
+		# override the serverIP wiht the static IP
+		if net_data.has_key("ipaddress"):
+			staticIP = net_data["ipaddress"]
+		else:
+			staticIP = net_data["ip"]
+	if staticIP:
+		print "Using static IP address"
+		if serverIP != staticIP:
+			serverIP = staticIP
+			#  Need to update the server record to make sure it has this IP address  
+			spin = ogsh_spin.getSpin()
+			spin.Device.update(
+				id = mid,
+				management_ip=staticIP,
+				peer_ip=staticIP,
+				primary_ip=staticIP
+			)
+	LOG.debug("Static IP is %s" % staticIP)
+
+	running = True
+	while running:
+		running = False
+		#set the ESX connection info VO with information retrieved from server attributes
+		esxVO = ESXServerConnectionInfoVO()
+		rref = RealmRef(realmId)
+		rref.setName(realmName)
+		esxVO.setRealm(rref)
+		esxVO.setConnectionIP(serverIP)
+		esxVO.setUsername("root")
+		esxVO.setPassword(password)
+		print "Trying to manage ESXi using IP address %s " % serverIP
+
+		#test connection with ESXi machine. loop until time out or connection succeeds.
+		conncResult = False
+		time.sleep(minWait)
+		while time.time() < maxWait:
+			try:
+				conncResult = testConnection(esxVO)
+				if ((conncResult == SUCCESS) or (conncResult == ERROR_AUTHORIZATION)):
+					break
+			except AgentlessManagementException, why:
+				#keep retrying testConnectionInfo does not throw a proper exception
+				# for different error conditions
+				LOG.debug("Connecting to ESXi Failed. A few failures are expected")
+				LOG.exception(why)
+				time.sleep(1)
+				pass
+			except:
+				LOG.debug("Connecting to  ESXi Failed. A few failures could happen")
+				LOG.debug(traceback.format_exc())
+				time.sleep(1)
+			sys.stdout.write(".")
+
+			#test if the IP address has changed, this may happen when provisioning with DHCP
+			if not staticIP:
+				# It's important to not do this for static, since we will pick up the wrong IP again
+				try:
+					ip_address = getDeviceAttribute("managementIP")
+					LOG.debug("managementIp is %s" % ip_address)
+				except Exception, why:
+					LOG.error("Failed to get managementIP")
+					LOG.exception(why)
+					ip_address = serverIP
+				if serverIP != ip_address:
+					serverIP = ip_address
+					sys.stdout.write("The server's IP address has changed to: %s\n" % ip_address)
+					running = True
+					break
+			else:
+				LOG.info("Connecting using static IP, bypassing IP update")
+			time.sleep(minWait)
+
+	#Manage the device remotely if the connectivity test succeeds
+	if conncResult == SUCCESS:
+		esxVO.setServer(ServerRef(mid))
+		numtries = 10
+		for tries in range(0,numtries):
+			try:
+				devRef = ts.virtualization.HypervisorService.manageRemotely(esxVO)
+				break
+			except:
+				LOG.debug("Managing ESXi Failed. A few failures could happen")
+				LOG.debug(traceback.format_exc())
+				time.sleep(tries + 1)
+				if tries == numtries - 1:
+					raise
+		print "Device is successfully set in to remote management mode"
+		print "Device ID: %s" % devRef.getId()
+		return SUCCESS
+	elif conncResult == ERROR_AUTHORIZATION:
+		print "You do not have permissions to manage hypervisors. Please check your permissions and try again."
+		return ERROR_AUTHORIZATION
+	else:
+		print "Connectivity test with installed ESXi was not successful."
+		return ERROR_CONNECTIVITY
+
+if __name__ == "__main__":
+	sys.exit(main())

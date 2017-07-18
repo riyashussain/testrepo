@@ -1,0 +1,117 @@
+#!/usr/bin/python
+# -*- mode: Python; tab-width: 4; indent-tabs-mode: nil; -*-
+# ex: set tabstop=4 :
+# Please do not change the two lines above. See PEP 8, PEP 263.
+#
+"""
+(c) Copyright 2010 Hewlett-Packard Development Company, L.P.
+Wrapper around spin.Device.clearRoles(), which handles removing
+stale attachments in the model to OS Profile, Policies, etc
+
+Optionally assigns the target server to a new OS Profile. If OS Profile
+is not provided, default to the "Not Assigned" node for the server's current
+platform
+"""
+from optparse import OptionParser
+import sys
+
+# pylint: disable=F0401,E0611
+from pytwist.com.opsware.custattr import NoSuchFieldException
+from pytwist.com.opsware.server import ServerRef
+from pytwist.com.opsware.custattr import CustomAttribute
+# pylint: enable=F0401,E0611
+from opsware_common import errors
+
+from osprov import sa
+from osprov.ogfs import ogsh_spin
+from osprov.errors import ShowErrorMessage
+from osprov.util import twist
+from osprov.osbp import ThisTargetServer
+from osprov.osbp import datastore
+
+
+class ResetInfo(object):
+
+    def __init__(self, spin, twistServer, serverRef):
+        self.spin = spin
+        self.twistServer = twistServer
+        self.serverRef = serverRef
+
+    def doReset(self, ignore_sysconfig=False, preserve_attrs="", assign_os_profile=None):
+        self.spin.Device.clearRoles(id=self.serverRef.getId())
+        attrsToPreserve = []
+        if not ignore_sysconfig:
+            roleClass = self.spin.RoleClass.getByPath(path=["ServiceLevel", "Opsware", "buildmgr"])
+            try:
+                reprovAttrNames = roleClass.getChildren(child_class="AppConfigWad")[0].getDictValue(
+                    key="bm.reprovision_attributes_to_preserve")
+                attrsToPreserve.extend(reprovAttrNames.split())
+            except errors.OpswareError, error:
+                # invalidParameterName is fine. There are none defined
+                if error.error_name != "spin.invalidParameterName":
+                    raise
+
+        if preserve_attrs:
+            attrsToPreserve.extend(preserve_attrs.split(","))
+        # Keep the datastore intact
+        attrsToPreserve.append(datastore.CA_NAME)
+
+        preserveDict = {}
+        for attrName in attrsToPreserve:
+            try:
+                preserveDict[attrName] = self.twistServer.server.ServerService.getCustAttr(
+                    self.serverRef, attrName, False)
+            except NoSuchFieldException:
+                pass
+
+        willDelete = self.twistServer.server.ServerService.getCustAttrs(
+            self.serverRef, None, False)
+        if willDelete:
+            print "Custom attributes that will be deleted:"
+            for key, value in willDelete.items():
+                if not (preserveDict.has_key(key) or key.startswith(CustomAttribute.OPSWARE_PRIVATE_KEY_PREFIX)):
+                    print "    %s=%s" % (key, value)
+
+        self.twistServer.server.ServerService.clearCustAttrs(self.serverRef)
+        if preserveDict:
+            print "Preserving the following custom attributes: %s" % ", ".join([
+                x for x in preserveDict.keys() if not x.startswith(CustomAttribute.OPSWARE_PRIVATE_KEY_PREFIX)])
+            self.twistServer.server.ServerService.setCustAttrs(self.serverRef, preserveDict)
+
+        if assign_os_profile:
+            profileVO = twist.getOSIP(self.twistServer, assign_os_profile)
+            self.spin.Device.applyTemplateByRCs(
+                id=self.serverRef.getId(), rc_ids=[profileVO.getRef().getId()],
+                mode="override", allow_platform_change=1)
+
+
+def main():
+    TARGET = ThisTargetServer()
+    parser = OptionParser(description=__doc__, version="0.0.1",
+                          usage='%prog [--assign_os_profile "OS Installation Profile Name"] [--preserve_attrs=attr1,attr2,attr3] [--ignore_sysconfig]')
+    parser.add_option("-a", "--preserve_attrs", dest="preserve_attrs", metavar="ATTR1,ATTR2",
+                      help="Comma delimited list of custom attribute names to preserve")
+    parser.add_option(
+        "-o", "--assign_os_profile", dest="assign_os_profile", metavar="OS Profile Name",
+        help="Name or ID of an OS Profile to which the target server should be assigned")
+    parser.add_option("-i", "--ignore_sysconfig", action="store_true",
+                      dest="ignore_sysconfig", default=False,
+                      help="By default we preserve the list of custom attribute names stored in SA system configuration setting \"bm.reprovision_attributes_to_preserve\". Specify this option to ignore these settings and remove all custom attributes not explicitly preserved.")
+    try:
+        opt, args = parser.parse_args(sys.argv[1:])
+        mid = TARGET.getId()
+        spin = ogsh_spin.getSpin()
+        reset = ResetInfo(spin, sa.getTwistServer(), ServerRef(mid))
+        reset.doReset(opt.ignore_sysconfig, opt.preserve_attrs,
+                      opt.assign_os_profile)
+    except ShowErrorMessage, ex:
+        sys.stderr.write(ex.args[0] + "\n")
+        return ex.args[1]
+    except errors.OpswareError, opswError:
+        sys.stderr.write("Error: %s - %s (%s)\n" % (opswError.error_name,
+                                                    opswError.params, opswError.faultCode))
+        return opswError.faultCode
+
+
+if __name__ == "__main__":
+    sys.exit(main())

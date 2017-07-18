@@ -1,0 +1,111 @@
+Parameter - @MediaServer@ /media/opsware/linux/ESXi-5.5
+#! /bin/sh
+# Copyright (C) 2010 Hewlett-Packard Development Company, L.P.
+# This script mounts nfs share on specified path.
+# $1 - hostname or IP of NFS server
+# $2 - share name
+# $3 - Mount point
+
+
+#regular expression for ip validation
+validIPexpr='^(25[0-5]|2[0-4][0-9]|[0-1]{1}[0-9]{2}|[1-9]{1}[0-9]{1}|[1-9])\.(25[0-5]|2[0-4][0-9]|[0-1]{1}[0-9]{2}|[1-9]{1}[0-9]{1}|[1-9]|0)\.(25[0-5]|2[0-4][0-9]|[0-1]{1}[0-9]{2}|[1-9]{1}[0-9]{1}|[1-9]|0)\.(25[0-5]|2[0-4][0-9]|[0-1]{1}[0-9]{2}|[1-9]{1}[0-9]{1}|[0-9])'
+
+# verify parameter count and display usage message is incorrrect parameters are passed
+if [ $# -lt 2 ] ; then
+    echo "Usage: mount_nfs_share <media server> <share name> [optional: mount point]"
+    exit 1
+fi
+
+mountPoint=${3-/mnt/media}
+
+# Can not mount on root directory ("/")
+if [ "$mountPoint" == "/" ] ; then
+     echo "Mounting NFS share on '/' is not permitted"
+     exit 8
+fi
+
+# Can not mount on relative path
+if  ! echo $mountPoint | grep -q "^/" ; then
+     echo "Mount point ${mountPoint} can not be determined"
+     exit 9
+fi
+
+
+# check if NFS server parameter passed is a valid IP address
+validIP=`echo $1 | grep -Ec $validIPexpr`
+hostverified=0
+
+#peform this check only if nslookup exists
+if [ $validIP -eq 0 ] && [ -e /usr/bin/nslookup ] ; then
+    if nslookup $1 > /dev/null ; then
+        # If valid hostname verify whether server is reachable
+        if ! ping -q -c 3 -w 5 $1 > /dev/null ; then
+            echo "NFS server ${1} is not reachable";
+            exit 2
+        fi
+    else
+        echo "NFS server ${1} is not a valid host name or IP address"
+        exit 3
+    fi
+    hostverified=1
+fi
+
+#perform this check if valid ip or hostname is not verified with nslookup
+if [ $validIP -ne 0 ] || [ $hostverified -eq 0 ] ; then
+    # If valid IP address verify whether server is reachable
+    if ! ping -q -c 10 -w 10 $1 > /dev/null ; then
+       echo "NFS server ${1} is not reachable";
+       exit 2
+    fi
+fi
+
+
+# check if mount already exists
+if mount | cut -d" " -f1-3 | grep -q "${1}:${2} on ${mountPoint}$" ; then
+    echo "The NFS share is already mounted on the desired mount point"
+    echo "$1" > /tmp/osbp_info/media_server
+    echo "$2" > /tmp/osbp_info/media_path 
+    echo "$mountPoint" > /tmp/osbp_info/media_mount
+    exit 0
+elif mount | cut -d" " -f3 | grep -q "${mountPoint}$"; then
+    # mount point exists and points to a different path
+    echo "The NFS share is already mounted to a different share name. Unmount it and try again"
+    exit 4
+fi
+
+#perform this check only if the rpcinfo is installed
+if [ -e /usr/sbin/rpcinfo ] ; then
+    # check if NFS service is running on the server
+    if  ! /usr/sbin/rpcinfo -p $1 | grep -q "nfs" ; then
+        echo "NFS service not running on specified server"
+        exit 5
+    fi
+fi
+
+# check if the mount point directory esixts , if not create the directory
+if [ ! -d "$mountPoint" ] ; then
+    if ! mkdir -p "$mountPoint" > /dev/null ; then
+        echo "Unable to create mount point directory ${mountPoint}"
+        exit 6
+    fi 
+fi
+
+# execute mount command
+mount -t nfs -o nolock "$1:$2" "$mountPoint"
+
+RETCODE=$?
+if [ $RETCODE -ne 0 ] ; then
+    # mount unsucessful
+    echo "Unable to mount specified NFS share, mount returned error code $RETCODE"
+    echo "please verify if share path ${2} is exported"
+    exit 7
+else
+    echo "NFS share ${1}:${2} is now mounted at ${mountPoint}"
+    if [ ! -d /tmp/osbp_info ]; then
+        mkdir /tmp/osbp_info
+    fi
+    echo "$1" > /tmp/osbp_info/media_server
+    echo "$2" > /tmp/osbp_info/media_path 
+    echo "$mountPoint" > /tmp/osbp_info/media_mount
+    exit 0
+fi

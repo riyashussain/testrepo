@@ -1,0 +1,65 @@
+#!/usr/bin/python
+# -*- mode: Python; tab-width: 4; indent-tabs-mode: nil; -*-
+# ex: set tabstop=4 :
+# Please do not change the two lines above. See PEP 8, PEP 263.
+""" (c) Copyright 2009 Hewlett-Packard Development Company, L.P.
+   bundle together all the steps into a single install boot image step
+"""
+
+import os
+import sys
+
+from pytwist.com.opsware.common import NotFoundException
+from pytwist.com.opsware.osprov import RunScriptPlanStep
+from pytwist.com.opsware.osprov import InstallZIPPlanStep
+from pytwist.com.opsware.script import ServerScriptRef
+from pytwist.com.opsware.script import OGFSScriptRef
+
+from librunplan import PlanRunner
+from librunplan import PlanOutputHandler
+
+from osprov import sa
+from osprov.osbp import ThisTargetServer
+from osprov.osbp import logger
+from osprov.errors import ShowErrorMessage
+
+Steps = (('Linux/Create Stub Partition', None), ('Linux/Copy Boot Media', None), ('Linux/ESXi Installation Utilities', '/tmp'), ('Deploy Agent', '-d /opt/hpsa_agent/ogfs-agent.zip -p "Red Hat Enterprise Linux Server 5 X86_64" -u'), ('Linux/Add ESXi Module', '-s /opt/hpsa_agent  -d'), ('Linux/Add ESXi Module', '-s /tmp/user.ks.cfg -a ks.cfg'), ('Linux/Install bootloader for ESXi', '--kernel_arguments="@kernel_arguments@"'))
+
+
+def main(argv=sys.argv, stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr):
+    sys.stdin = stdin
+    sys.stderr = stderr
+    sys.stdout = stdout
+    Twist = sa.getTwistServer()
+    Target = ThisTargetServer(twistServer=Twist)
+    runnerOH = PlanOutputHandler(stdout, stderr, logger.getIt("Composite step"))
+    runnerOH.NO_APX_PROGRESS = True  # don't break the papx reporting
+    runnerOH.ADV_STEP_MSG = None  # don't update the main message
+    runnerOH.ADV_STEP_MSG_LONG = "\nSub Step: %(action)s '%(name)s'"
+    runnerOH.ERR_HEADER = "\nErrors from sub step %(current)d '%(name)s':\n"
+    Runner = PlanRunner(None, targetServer=Target, outputHandler=runnerOH)
+    for scriptPath, parameters in Steps:
+        scriptElems = [x for x in scriptPath.split("/") if x]
+        try:
+            stepRef = Twist.folder.FolderService.getFNode(
+                ["Opsware", "Tools", "OS Provisioning", "OS Build Plan Steps"] +
+                scriptElems)
+            if isinstance(stepRef, ServerScriptRef) or isinstance(stepRef, OGFSScriptRef):
+                step = RunScriptPlanStep()
+                step.setScript(stepRef)
+                step.setParameters(parameters)
+            else:
+                step = InstallZIPPlanStep()
+                step.setZip(stepRef)
+                step.setInstallPath(parameters)
+            Runner.doStep(step, stepNo=int(os.environ["CURRENT_STEP_NO"]))
+        except (NotFoundException), why:
+            runnerOH.exception("Error : sub step '%s' not found! %s" %
+                              (scriptPath, why), why)
+            sys.exit(101)
+        except ShowErrorMessage, why:
+            runnerOH.exception("Sub Step '%s' failed: %s" % (scriptPath, why[0]), why)
+            sys.exit(100)
+
+if __name__ == "__main__":
+    main()

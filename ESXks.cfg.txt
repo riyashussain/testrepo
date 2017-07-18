@@ -1,0 +1,30 @@
+#!/bin/sh
+DATA='# Accept the VMware End User License Agreement
+vmaccepteula
+# Set the root password for the DCUI and Tech Support Mode
+rootpw "@root_password:opsware@"
+# Choose the first discovered disk to install onto
+# Note for more advanced partitioning, you may want to replace and customize
+# this section
+install --firstdisk --overwritevmfs
+# reboot after installation
+reboot
+# Set the network to DHCP on the first network adapater
+network --bootproto=dhcp --device=vmnic0
+
+# A sample post-install script
+%post --interpreter=python --ignorefailure=true
+import time
+stampFile = file("/finished.stamp", mode="w")
+stampFile.write( time.asctime() )
+'
+
+##### DO NOT MODIFY THE CODE BELOW THIS LINE #####
+
+FILE="files/root/tmp/user.ks.cfg"
+if ! [ -d `dirname "${FILE}"` ] ; then
+   echo "Directory `dirname ${FILE}` is not there. Is your target server in the state you expect?"
+   exit 2 
+fi   
+
+echo "${DATA}" > "${FILE}"

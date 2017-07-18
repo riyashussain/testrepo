@@ -1,0 +1,237 @@
+#!/usr/bin/python
+# -*- mode: Python; tab-width: 4; indent-tabs-mode: nil; -*-
+# ex: set tabstop=4 :
+# Please do not change the two lines above. See PEP 8, PEP 263.
+"""
+ Inject required options and move the required boot files onto the stub partition.
+
+(c) Copyright 2013 Hewlett-Packard Development Company, L.P.
+"""
+import os
+import sys
+import optparse
+from StringIO import StringIO
+
+from osprov import helpers
+from osprov.osbp import ThisTargetServer
+from osprov.errors import ShowErrorMessage
+from osprov.osbp.helpers import getMediaURL
+from osprov.parsers.netconfig import SmartNetconfig, OLD_SYNTAX_WARNING
+from osprov.profile import Kickstart, ProfileError
+from osprov.profile.kickstart import Script, Directive
+
+HPSA_NETCONFIG = """@hpsa_netconfig@"""
+
+BASE_KS_FILE = "tmp/user.ks.cfg"
+
+
+def initKickstart(baseFile):
+    """ Initialize a Kickstart object """
+    return Kickstart(open(baseFile, "r"))
+
+
+def removeConflictingOsprov(ksobj):
+    """ Remove conflicting directives  """
+    if hasattr(ksobj, "install"):
+        for instance in ksobj.getDirectiveList("install"):
+            print "Removing %s from the profile" % instance
+            instance.name = "#%s" % instance.name
+
+
+def injectRequiredOsprov(ksobj, mediaUrl):
+    """ inject settings required for OS provisioning to work
+            currently it only injects the nfs share. ESX uses different syntax.
+    """
+    if not hasattr(ksobj, "install"):
+        inst = Directive("install")
+        if mediaUrl.scheme == "nfs":
+            inst[1] = "nfs"
+            inst["server"] = mediaUrl.netloc
+            inst["dir"] = mediaUrl.path
+        elif mediaUrl.scheme in ["http", "https"]:
+            if mediaUrl.username:
+                raise ShowErrorMessage(
+                    "ESXi 4.1 doesn't support installing from a media server that requires authentication.", 100)
+            inst[1] = "url"
+            inst[2] = mediaUrl.canonical()
+        else:
+            raise ShowErrorMessage(
+                "ERROR: %s is not supported at this time" % mediaUrl.scheme)
+        ksobj.directives.append(inst)
+
+
+def hasEncPasswd(ksobj):
+    """Check if the root pwd is encrypted """
+    try:
+        if ksobj.rootpw["iscrypted"]:
+            pass
+        return True
+    except (KeyError, AttributeError):
+        return False
+
+
+def injectPost(ksobj, unsupported, agentGW, mid, crypto):
+    """ Inject code to stall the installer"""
+    # Don't inject the IP change script  if this is static provisioning
+
+    for script in ksobj.scripts:
+        if script.type == "post" and \
+                "###  CODE BY HPSA ###" in [x.strip() for x in script.contents]:
+            return
+
+    agentSrv, opswareCaCrt = crypto
+
+    contents = []
+    contents.append("###  CODE BY HPSA ###")
+    contents.append("#### DON'T REMOVE THE ABOVE COMMENT ###")
+
+    contents.extend(("""
+
+cat > /tmp/hpsa_agent_mid << EOF
+%(mid)s
+EOF
+
+cat > /tmp/hpsa_agent.srv << EOF
+%(agentSrv)s
+EOF
+
+cat > /tmp/hpsa_ca.crt << EOF
+%(opswareCaCrt)s
+EOF
+
+cd /tmp
+tar xzf /hpsa_agent.tar.gz
+cd usr/hpsa_agent
+cp osprov/esxi_reg.sh /tmp/esxi_reg.sh
+chmod 755 /tmp/esxi_reg.sh
+if which localcli ; then
+    localcli network firewall set -e false
+    localcli network firewall get >> /tmp/hpsa_osprov.out
+fi
+/tmp/esxi_reg.sh "/tmp/usr/hpsa_agent" "%(agentGw)s"
+RC=$?
+if which localcli ; then
+    localcli network firewall set -e true
+    localcli network firewall get >> /tmp/hpsa_osprov.out
+fi
+exit $RC
+""" % {'mid': mid, 'agentSrv': agentSrv, 'opswareCaCrt': opswareCaCrt, 'agentGw': agentGW}).split("\n"))
+
+    contents.append('### END OF HPSA CODE ###')
+
+    post = Script("post")
+    if unsupported:
+        post["unsupported"] = None
+    post["interpreter"] = "busybox"
+    post["ignorefailure"] = "false"
+
+    post.contents.extend(contents)
+    ksobj.scripts.append(post)
+
+
+def writeFinalKs(ksobj):
+    """ Write the kickstart file onto the boot disk """
+    ksfile = open(BASE_KS_FILE, "w")
+    ksfile.write(str(ksobj))
+    ksfile.close()
+    print "Kickstart file written to disk"
+
+
+def handleOsprov(ksobj, keys):
+    """ change the profile to suit the environment """
+    removeConflictingOsprov(ksobj)
+    injectRequiredOsprov(ksobj, getMediaURL(keys))
+
+
+def parseArgs(args):
+    """Parse the command line arguments"""
+    parser = optparse.OptionParser(description=__doc__, version='0.0.1', )
+    parser.add_option('--accept-encrypted-password', default=False, dest="acceptencrypted",
+                      help="Continue installation even if user has given an encrypted password ",
+                      action="store_true")
+    parser.add_option("--disableWarning", dest="disableWarning", action="store_true",
+                      default=False,
+                      help="Do not show warnings of old hpsa_netconfig format")
+
+    opt, args = parser.parse_args(args)
+    return opt
+
+
+def injectDevice(ksobj, targetServer):
+    ksobj.network["device"] = targetServer.getMACAddress()
+
+
+def getProvisioningNIC(netinfo):
+    """ Searches for and return the provisioning NIC """
+    provisioningNics = [nic for nic in netinfo.nics if nic.provisioning]
+    if len(provisioningNics) > 1:
+        print "Warning: Only one provisioning NIC will be configured from the netconfig"
+    return provisioningNics[0]
+
+
+def main():
+
+    opt = parseArgs(sys.argv[1:])
+
+    unsupported = False
+    # FLAG_OVERRIDE #
+    # parse out flags
+    try:
+        targetServer = ThisTargetServer()
+        targetServer.setWorkDir(targetServer.getRemoteRoot())
+        ksobj = initKickstart(BASE_KS_FILE)
+        # exit if unable to retrieve password from ks.cfg
+        try:
+            ksobj.rootpw[1]
+        except (KeyError, AttributeError):
+            print "Unable to read root password from kick start file. "\
+                  "Please verify kickstart configuration in the build plan"
+            return 10
+
+        if hasEncPasswd(ksobj) and not opt.acceptencrypted:
+            print "Can not proceed with installation as the root password is encrypted"
+            return 11
+        else:
+            # Save the root password for lather use
+            keys = helpers.getDataStore(targetServer)
+            keys.profile.username = "root"
+            keys.profile.password = ksobj.rootpw[1]
+            helpers.putDataStore(keys, targetServer)
+        # Extra steps
+        # Below comment is used to generate scripts with additional actions,
+        # don't remove
+        # EXTRA STEPS #
+
+        netconfigParser = SmartNetconfig.readwrite(
+            StringIO(HPSA_NETCONFIG),
+            activeMacAddress=targetServer.getMACAddress(),
+            ipv6default=targetServer.isIPv6Managed()
+        )
+        netinfo = netconfigParser.info()
+        if netinfo.oldSyntax and not opt.disableWarning:
+            newFormat = netconfigParser.format()
+            print OLD_SYNTAX_WARNING + "\n%s" % str(newFormat)
+
+        typosList = netconfigParser.getTyposList()
+        if typosList:
+            print("The following keys were not recognized in the netconfig CA and could be typos: %s" % typosList)
+
+        provisioningNIC = getProvisioningNIC(netinfo)
+
+        if not (provisioningNIC.ipv4Networks or provisioningNIC.ipv6Networks):
+            agwIpPort = targetServer.getRandomAgentGateway()
+            mid = targetServer.getId()
+            agentSrv = targetServer.readFile(
+                os.path.join(targetServer.localServer.CRYPTO_DIR, "agent.srv"))
+            opswareCaCrt = targetServer.readFile(
+                os.path.join(targetServer.localServer.CRYPTO_DIR, "opsware-ca.crt"))
+            injectPost(ksobj, unsupported, agwIpPort, mid, (agentSrv, opswareCaCrt))
+        injectDevice(ksobj, targetServer)
+        writeFinalKs(ksobj)
+        print "Successfully injected required settings"
+    except (IOError, OSError, ProfileError, ShowErrorMessage), why:
+        sys.stderr.write("Failed to inject required settings.%s\n" % why)
+        return 1
+
+if __name__ == "__main__":
+    sys.exit(main())
